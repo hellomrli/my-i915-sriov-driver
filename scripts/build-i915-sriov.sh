@@ -118,7 +118,12 @@ log "i915 vermagic: $vermagic"
 [ "$(echo "$vermagic" | xargs)" = "$(echo "$KERNEL_RELEASE SMP preempt mod_unload" | xargs)" ] || die "Vermagic mismatch: got '$vermagic', expected '$KERNEL_RELEASE SMP preempt mod_unload'"
 
 # ---------- 5. package .txz ----------
-PKG_VERSION="${I915_SRIOV_REF//./}"
+# Keep the upstream dots (2026.09.16). Stripping them packed 2026.08.12.1 into
+# the 9-digit 202608121 and 2026.09.16 into the 8-digit 20260916, and `sort -V`
+# compares a digit run by numeric value: the older release outranked every later
+# one. That made the manager plugin miss updates and made Unraid's own
+# upgradepkg refuse the new package as a downgrade.
+PKG_VERSION="${I915_SRIOV_REF}"
 PKG_NAME="i915-sriov-${PKG_VERSION}-${KERNEL_RELEASE}-${PACKAGE_BUILD}"
 STAGE="$BUILD_DIR/stage-${PKG_NAME}"
 rm -rf "$STAGE"
