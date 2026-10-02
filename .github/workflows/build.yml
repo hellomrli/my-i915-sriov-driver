@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       i915_ref:
-        description: 'strongtz/i915-sriov-dkms tag to build (e.g. 2026.08.12.1), or "latest"'
+        description: 'strongtz/i915-sriov-dkms ref to build (tag/branch/SHA), or "latest" = master HEAD (newest patches)'
         required: false
         default: 'latest'
         type: string
@@ -65,14 +65,21 @@ jobs:
           set -euo pipefail
           ref="${I915_REF_INPUT:-latest}"
           if [ "$ref" = "latest" ]; then
-            # fetch the newest strongtz release tag
-            ref="$(curl -fsSL https://api.github.com/repos/strongtz/i915-sriov-dkms/releases/latest \
-              | jq -r '.tag_name')"
+            # Track upstream master HEAD, not the last release tag: master
+            # carries the newest fixes (e.g. VF/PF hardening) long before a
+            # release is tagged. Pin the exact SHA for reproducibility.
+            api="https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/master"
+            ref="$(curl -fsSL "$api" | jq -r '.sha')"
           fi
           # strip a leading 'v' if present
           ref="${ref#v}"
           echo "i915_ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "Resolved strongtz ref: $ref"
+          # giganode-style package version: committer date of the snapshot
+          # (YYYYMMDD, always 8 digits so sort -V orders builds correctly).
+          cdate="$(curl -fsSL "https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/${ref}" \
+            | jq -r '.commit.committer.date' | cut -dT -f1 | tr -d -)"
+          echo "pkg_version=$cdate" >> "$GITHUB_OUTPUT"
+          echo "Resolved strongtz ref: $ref (snapshot date $cdate)"
 
       - name: Resolve kernel release
         id: resolve_kernel
@@ -97,6 +104,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL_RELEASE: ${{ steps.resolve_kernel.outputs.kernel_release }}
           I915_REF: ${{ steps.resolve.outputs.i915_ref }}
+          PKG_VERSION: ${{ steps.resolve.outputs.pkg_version }}
         run: |
           set -euo pipefail
           # 手动触发永远编译；只有定时任务才做“有新版本才编译”的判断
@@ -105,7 +113,6 @@ jobs:
             echo "Manual dispatch: always build"
             exit 0
           fi
-          pkgver="${I915_REF//./}"
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
           rid="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${api}/tags/${KERNEL_RELEASE}" | jq -r '.id // empty' 2>/dev/null || true)"
           if [ -z "$rid" ]; then
@@ -113,17 +120,15 @@ jobs:
             echo "new_version=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Packages are named with the upstream dots (2026.09.16); releases
-          # published before that change used the dot-stripped form (20260916).
-          # Either name means this ref is already built, so a version is never
-          # rebuilt just because the naming convention changed.
+          # Package version is the upstream snapshot date (e.g. 20261002); an
+          # asset with that name means this exact snapshot is already built.
           if curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${api}/${rid}/assets?per_page=100" | \
-             jq -e --arg new "i915-sriov-${I915_REF}-" --arg legacy "i915-sriov-${pkgver}-" \
-               'any(.[]; (.name | startswith($new) or startswith($legacy)))' >/dev/null 2>&1; then
-            echo "strongtz ${I915_REF} @ ${KERNEL_RELEASE} already built; skipping"
+             jq -e --arg new "i915-sriov-${PKG_VERSION}-" \
+               'any(.[]; .name | startswith($new))' >/dev/null 2>&1; then
+            echo "strongtz snapshot ${PKG_VERSION} @ ${KERNEL_RELEASE} already built; skipping"
             echo "new_version=false" >> "$GITHUB_OUTPUT"
           else
-            echo "New driver needed: strongtz ${I915_REF} @ ${KERNEL_RELEASE}"
+            echo "New driver needed: strongtz ${PKG_VERSION} (${I915_REF}) @ ${KERNEL_RELEASE}"
             echo "new_version=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -134,6 +139,7 @@ jobs:
           I915_SRIOV_REF: ${{ steps.resolve.outputs.i915_ref }}
           KERNEL_RELEASE: ${{ steps.resolve_kernel.outputs.kernel_release }}
           TARGET_KERNEL_VERSION: ${{ steps.resolve_kernel.outputs.kernel_release }}
+          PACKAGE_VERSION: ${{ steps.resolve.outputs.pkg_version }}
           PACKAGE_BUILD: ${{ inputs.package_build }}
         run: |
           set -euo pipefail
@@ -148,6 +154,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL_RELEASE: ${{ steps.resolve_kernel.outputs.kernel_release }}
           I915_REF: ${{ steps.resolve.outputs.i915_ref }}
+          PKG_VERSION: ${{ steps.resolve.outputs.pkg_version }}
         run: |
           set -euo pipefail
           pkg="$(ls out/i915-sriov-*.txz | head -1)"
@@ -160,7 +167,7 @@ jobs:
           if [ -z "$rid" ]; then
             rid="$(curl -fsSL -X POST -H "Authorization: Bearer ${GH_TOKEN}" \
                    -H "Accept: application/vnd.github+json" \
-                   -d "{\"tag_name\":\"${release_tag}\",\"name\":\"i915 SR-IOV for ${release_tag}\",\"body\":\"Auto-built from strongtz/i915-sriov-dkms @ ${I915_REF}\"}" \
+                   -d "{\"tag_name\":\"${release_tag}\",\"name\":\"i915 SR-IOV for ${release_tag}\",\"body\":\"Auto-built from strongtz/i915-sriov-dkms @ ${I915_REF} (snapshot ${PKG_VERSION}, i915-only)\"}" \
                    "${api}" | jq -r '.id')"
           fi
           # upload (or replace) the package assets via uploads.github.com
