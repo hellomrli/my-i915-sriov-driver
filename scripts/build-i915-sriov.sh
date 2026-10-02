@@ -18,6 +18,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/package-version.sh"
 
 # ---------- config (overridable via environment) ----------
 TARGET_KERNEL_VERSION="${TARGET_KERNEL_VERSION:-6.18.44}"
@@ -100,10 +101,22 @@ fi
 git -C "$I915_DIR" fetch --depth 1 origin "$I915_SRIOV_REF"
 git -C "$I915_DIR" reset --hard FETCH_HEAD
 git -C "$I915_DIR" clean -ffdqx
+SOURCE_COMMIT="$(git -C "$I915_DIR" rev-parse HEAD)"
 if [ -n "$I915_SRIOV_COMMIT" ]; then
-  actual="$(git -C "$I915_DIR" rev-parse HEAD)"
-  [ "$actual" = "$I915_SRIOV_COMMIT" ] || die "i915 commit mismatch: expected $I915_SRIOV_COMMIT, got $actual"
+  [ "$SOURCE_COMMIT" = "$I915_SRIOV_COMMIT" ] || die "i915 commit mismatch: expected $I915_SRIOV_COMMIT, got $SOURCE_COMMIT"
 fi
+
+# Use the fetched snapshot's committer date, never the build date or DKMS
+# version. UTC keeps local git timestamps consistent with the GitHub API.
+SOURCE_DATE="$(snapshot_date_utc "$(git -C "$I915_DIR" log -1 --format=%ct)")"
+PKG_VERSION="$(normalize_package_version "${PACKAGE_VERSION:-$SOURCE_DATE}")"
+PKG_NAME="i915-sriov-${PKG_VERSION}-${KERNEL_RELEASE}-${PACKAGE_BUILD}"
+{
+  log "Upstream commit: $SOURCE_COMMIT"
+  log "Upstream date: $SOURCE_DATE (UTC)"
+  log "Package version: $PKG_VERSION"
+  log "Package: ${PKG_NAME}.txz"
+} 2>&1 | tee "$OUT_DIR/build-i915.log"
 
 # ---------- 3. Unraid slab-compat patch ----------
 PATCH="$ROOT_DIR/patches/strongtz-2026.08.08-unraid-6x-slab.patch"
@@ -121,7 +134,7 @@ sed -i '\|^obj-m += drivers/gpu/drm/xe/$|d' "$I915_DIR/Makefile"
 # ---------- 4. build modules ----------
 log "Building modules against ${KERNEL_RELEASE} (CC=$CC, JOBS=$JOBS)"
 need_cmd make
-kmake -j"$JOBS" M="$I915_DIR" modules 2>&1 | tee "$OUT_DIR/build-i915.log"
+kmake -j"$JOBS" M="$I915_DIR" modules 2>&1 | tee -a "$OUT_DIR/build-i915.log"
 
 for m in \
   "$I915_DIR/drivers/gpu/drm/i915/i915.ko" \
@@ -134,12 +147,8 @@ log "i915 vermagic: $vermagic"
 [ "$(echo "$vermagic" | xargs)" = "$(echo "$KERNEL_RELEASE SMP preempt mod_unload" | xargs)" ] || die "Vermagic mismatch: got '$vermagic', expected '$KERNEL_RELEASE SMP preempt mod_unload'"
 
 # ---------- 5. package .txz ----------
-# giganode-style versioning: the package version is the committer date of the
-# upstream snapshot (YYYYMMDD, e.g. 20261002). It is always 8 digits, so
-# `sort -V` orders releases correctly and both the manager plugin and Unraid's
-# upgradepkg recognise newer builds.
-PKG_VERSION="${PACKAGE_VERSION:-$(git -C "$I915_DIR" log -1 --format=%cs | tr -d -)}"
-PKG_NAME="i915-sriov-${PKG_VERSION}-${KERNEL_RELEASE}-${PACKAGE_BUILD}"
+# PKG_VERSION was resolved from the fetched source before compilation.
+# YYYY.MM.DD keeps the source date readable and preserves leading zeroes.
 STAGE="$BUILD_DIR/stage-${PKG_NAME}"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/lib/modules/${KERNEL_RELEASE}/updates/compat"
@@ -185,8 +194,10 @@ md5sum "$OUT_DIR/${PKG_NAME}.txz" > "$OUT_DIR/${PKG_NAME}.txz.md5"
 
 # installed-modules manifest for verification
 {
-  echo "upstream commit: $(git -C "$I915_DIR" rev-parse HEAD)"
-  echo "upstream date:   $(git -C "$I915_DIR" log -1 --format=%cs)"
+  echo "upstream commit: $SOURCE_COMMIT"
+  echo "upstream date:   $SOURCE_DATE (UTC)"
+  echo "package version: $PKG_VERSION"
+  echo "package file:    ${PKG_NAME}.txz"
   echo "i915 module:     $(modinfo -F version "$I915_DIR/drivers/gpu/drm/i915/i915.ko" | head -1)"
   echo "vermagic:        $vermagic"
   echo "max_vfs:         $I915_MAX_VFS"

@@ -63,23 +63,23 @@ jobs:
           I915_REF_INPUT: ${{ inputs.i915_ref }}
         run: |
           set -euo pipefail
+          source scripts/package-version.sh
           ref="${I915_REF_INPUT:-latest}"
           if [ "$ref" = "latest" ]; then
-            # Track upstream master HEAD, not the last release tag: master
-            # carries the newest fixes (e.g. VF/PF hardening) long before a
-            # release is tagged. Pin the exact SHA for reproducibility.
-            api="https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/master"
-            ref="$(curl -fsSL "$api" | jq -r '.sha')"
+            # Track master HEAD, not the last release tag.
+            ref="master"
           fi
-          # strip a leading 'v' if present
-          ref="${ref#v}"
-          echo "i915_ref=$ref" >> "$GITHUB_OUTPUT"
-          # giganode-style package version: committer date of the snapshot
-          # (YYYYMMDD, always 8 digits so sort -V orders builds correctly).
-          cdate="$(curl -fsSL "https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/${ref}" \
-            | jq -r '.commit.committer.date' | cut -dT -f1 | tr -d -)"
-          echo "pkg_version=$cdate" >> "$GITHUB_OUTPUT"
-          echo "Resolved strongtz ref: $ref (snapshot date $cdate)"
+          # Resolve every ref once, keeping its SHA and date from the same
+          # response. Preserve tag names (including v) and branch slashes.
+          encoded_ref="$(jq -rn --arg ref "$ref" '$ref | @uri')"
+          commit="$(curl -fsSL "https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/${encoded_ref}")"
+          sha="$(jq -er '.sha | select(type == "string") | select(test("^[0-9a-f]{40}$"))' <<< "$commit")"
+          timestamp="$(jq -er '.commit.committer.date | select(type == "string")' <<< "$commit")"
+          cdate="$(snapshot_date_utc "$timestamp")"
+          pkg_version="$(normalize_package_version "$cdate")"
+          echo "i915_ref=$sha" >> "$GITHUB_OUTPUT"
+          echo "pkg_version=$pkg_version" >> "$GITHUB_OUTPUT"
+          echo "Resolved strongtz ref: $ref -> $sha (snapshot date $pkg_version UTC)"
 
       - name: Resolve kernel release
         id: resolve_kernel
@@ -120,8 +120,8 @@ jobs:
             echo "new_version=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Package version is the upstream snapshot date (e.g. 20261002); an
-          # asset with that name means this exact snapshot is already built.
+          # Date-based deduplication does not distinguish commits on the same
+          # UTC day. Package versions now use YYYY.MM.DD (e.g. 2026.10.02).
           if curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${api}/${rid}/assets?per_page=100" | \
              jq -e --arg new "i915-sriov-${PKG_VERSION}-" \
                'any(.[]; .name | startswith($new))' >/dev/null 2>&1; then
@@ -137,6 +137,7 @@ jobs:
         shell: bash
         env:
           I915_SRIOV_REF: ${{ steps.resolve.outputs.i915_ref }}
+          I915_SRIOV_COMMIT: ${{ steps.resolve.outputs.i915_ref }}
           KERNEL_RELEASE: ${{ steps.resolve_kernel.outputs.kernel_release }}
           TARGET_KERNEL_VERSION: ${{ steps.resolve_kernel.outputs.kernel_release }}
           PACKAGE_VERSION: ${{ steps.resolve.outputs.pkg_version }}
