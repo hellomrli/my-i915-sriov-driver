@@ -60,6 +60,7 @@ jobs:
         id: resolve
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           I915_REF_INPUT: ${{ inputs.i915_ref }}
         run: |
           set -euo pipefail
@@ -72,7 +73,7 @@ jobs:
           # Resolve every ref once, keeping its SHA and date from the same
           # response. Preserve tag names (including v) and branch slashes.
           encoded_ref="$(jq -rn --arg ref "$ref" '$ref | @uri')"
-          commit="$(curl -fsSL "https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/${encoded_ref}")"
+          commit="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/${encoded_ref}")"
           sha="$(jq -er '.sha | select(type == "string") | select(test("^[0-9a-f]{40}$"))' <<< "$commit")"
           timestamp="$(jq -er '.commit.committer.date | select(type == "string")' <<< "$commit")"
           cdate="$(snapshot_date_utc "$timestamp")"
@@ -85,13 +86,14 @@ jobs:
         id: resolve_kernel
         shell: bash
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL_RELEASE_INPUT: ${{ inputs.kernel_release }}
         run: |
           set -euo pipefail
           kr="${KERNEL_RELEASE_INPUT:-latest}"
           if [ "$kr" = "latest" ]; then
             # fetch the newest ich777 Unraid kernel release tag
-            kr="$(curl -fsSL https://api.github.com/repos/ich777/unraid_kernel/releases/latest \
+            kr="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/ich777/unraid_kernel/releases/latest \
               | jq -r '.tag_name')"
           fi
           echo "kernel_release=$kr" >> "$GITHUB_OUTPUT"
