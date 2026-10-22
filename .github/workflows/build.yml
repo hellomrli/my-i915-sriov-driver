@@ -3,11 +3,6 @@ name: Build i915 SR-IOV driver for Unraid
 on:
   workflow_dispatch:
     inputs:
-      i915_ref:
-        description: 'strongtz/i915-sriov-dkms ref to build (tag/branch/SHA), or "latest" = master HEAD (newest patches)'
-        required: false
-        default: 'latest'
-        type: string
       kernel_release:
         description: 'Unraid kernel release to build for (e.g. 6.18.44-Unraid), or "latest" to auto-detect from ich777/unraid_kernel'
         required: false
@@ -19,8 +14,7 @@ on:
         default: '1'
         type: string
   schedule:
-    # 每天定时检测 strongtz/i915-sriov-dkms 与 ich777/unraid_kernel 两个仓库，
-    # 只有当任一仓库发布新版本时才编译；都没更新则跳过。
+    # 每天定时检测上游 master SHA 与 ich777 最新内核；相同源码和内核才跳过。
     - cron: '30 3 * * *'
 
 permissions:
@@ -35,9 +29,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
-      # GCC 15 matches the official Unraid kernel toolchain; the 6.18 kernel
-      # requires -fmin-function-alignment (gcc >= 14).
-      image: gcc:15.3.0
+      # Pin the current stable GCC, independently of the kernel's compiler.
+      # Newer Unraid kernels require -fmin-function-alignment (gcc >= 14).
+      image: gcc:16.2.0
     env:
       DEBIAN_FRONTEND: noninteractive
       TZ: UTC
@@ -51,27 +45,29 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates curl flex git jq kmod \
-            libelf-dev make tar xz-utils
+            libelf-dev make python3 tar xz-utils
           rm -rf /var/lib/apt/lists/*
           gcc --version | head -1
           nproc
+
+      - name: Test build tooling
+        shell: bash
+        run: |
+          bash -n scripts/*.sh
+          python3 -m unittest discover -s tests -v
 
       - name: Resolve i915 ref
         id: resolve
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          I915_REF_INPUT: ${{ inputs.i915_ref }}
         run: |
           set -euo pipefail
           source scripts/package-version.sh
-          ref="${I915_REF_INPUT:-latest}"
-          if [ "$ref" = "latest" ]; then
-            # Track master HEAD, not the last release tag.
-            ref="master"
-          fi
-          # Resolve every ref once, keeping its SHA and date from the same
-          # response. Preserve tag names (including v) and branch slashes.
+          # Always build the newest supported driver line, including master
+          # commits made after release 2026.09.16; never select legacy branches.
+          ref=master
+          # Resolve the master head and its commit date from the same response.
           encoded_ref="$(jq -rn --arg ref "$ref" '$ref | @uri')"
           commit="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/${encoded_ref}")"
           sha="$(jq -er '.sha | select(type == "string") | select(test("^[0-9a-f]{40}$"))' <<< "$commit")"
@@ -116,18 +112,22 @@ jobs:
             exit 0
           fi
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
-          rid="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${api}/tags/${KERNEL_RELEASE}" | jq -r '.id // empty' 2>/dev/null || true)"
+          release="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${api}/tags/${KERNEL_RELEASE}" 2>/dev/null || true)"
+          rid="$(jq -r '.id // empty' <<< "$release" 2>/dev/null || true)"
           if [ -z "$rid" ]; then
             echo "No release for ${KERNEL_RELEASE} yet -> new driver needed"
             echo "new_version=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Date-based deduplication does not distinguish commits on the same
-          # UTC day. Package versions now use YYYY.MM.DD (e.g. 2026.10.02).
-          if curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${api}/${rid}/assets?per_page=100" | \
-             jq -e --arg new "i915-sriov-${PKG_VERSION}-" \
-               'any(.[]; .name | startswith($new))' >/dev/null 2>&1; then
-            echo "strongtz snapshot ${PKG_VERSION} @ ${KERNEL_RELEASE} already built; skipping"
+          release_body="$(jq -r '.body // ""' <<< "$release")"
+          pkg_prefix="i915-sriov-${PKG_VERSION}-${KERNEL_RELEASE}-"
+          if [[ "$release_body" == *"strongtz/i915-sriov-dkms @ ${I915_REF} (snapshot ${PKG_VERSION},"* ]] && \
+             jq -e --arg prefix "$pkg_prefix" '
+               [.assets[]?.name] as $names |
+               any($names[]; select(startswith($prefix) and endswith(".txz")) |
+                 . as $pkg | $names | index($pkg + ".md5") != null)
+             ' <<< "$release" >/dev/null; then
+            echo "strongtz master commit ${I915_REF} @ ${KERNEL_RELEASE} already built; skipping"
             echo "new_version=false" >> "$GITHUB_OUTPUT"
           else
             echo "New driver needed: strongtz ${PKG_VERSION} (${I915_REF}) @ ${KERNEL_RELEASE}"
@@ -164,13 +164,16 @@ jobs:
           pkg_base="$(basename "$pkg")"
           release_tag="${KERNEL_RELEASE}"
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
-          # find or create the release for this kernel tag
-          rid="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-                  "${api}/tags/${release_tag}" | jq -r '.id // empty' 2>/dev/null || true)"
+          # Find or create the release for this kernel tag.
+          release="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                    "${api}/tags/${release_tag}" 2>/dev/null || true)"
+          rid="$(jq -r '.id // empty' <<< "$release" 2>/dev/null || true)"
+          release_body="$(jq -r '.body // ""' <<< "$release" 2>/dev/null || true)"
           if [ -z "$rid" ]; then
             rid="$(curl -fsSL -X POST -H "Authorization: Bearer ${GH_TOKEN}" \
                    -H "Accept: application/vnd.github+json" \
-                   -d "{\"tag_name\":\"${release_tag}\",\"name\":\"i915 SR-IOV for ${release_tag}\",\"body\":\"Auto-built from strongtz/i915-sriov-dkms @ ${I915_REF} (snapshot ${PKG_VERSION}, i915-only)\"}" \
+                   -d "$(jq -n --arg tag "$release_tag" --arg name "i915 SR-IOV for ${release_tag}" \
+                     '{tag_name:$tag,name:$name,body:"Build in progress."}')" \
                    "${api}" | jq -r '.id')"
           fi
           # upload (or replace) the package assets via uploads.github.com
@@ -189,4 +192,15 @@ jobs:
               --data-binary "@$f" \
               "${upload_api}?name=${base}"
           done
+          # Mark this SHA built only after both uploads succeed, preserving
+          # release notes other than the previous auto-generated source line.
+          release_body="$(sed '\|^Auto-built from strongtz/i915-sriov-dkms @ .* (snapshot .*, i915-only)$|d' <<< "$release_body")"
+          if [ -n "$release_body" ]; then
+            release_body+=$'\n\n'
+          fi
+          release_body+="Auto-built from strongtz/i915-sriov-dkms @ ${I915_REF} (snapshot ${PKG_VERSION}, i915-only)"
+          curl -fsSL -X PATCH -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$(jq -n --arg body "$release_body" '{body:$body}')" \
+            "${api}/${rid}" >/dev/null
           echo "Published ${pkg_base} to release ${release_tag}"

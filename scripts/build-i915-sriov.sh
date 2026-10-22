@@ -9,7 +9,7 @@
 #   2. clone strongtz/i915-sriov-dkms at the requested ref (default: master,
 #      so the package always carries the newest upstream fixes, not just the
 #      last tagged release)
-#   3. apply the Unraid 6.x slab-compat patch
+#   3. apply Unraid slab and DRM client-event compatibility patches
 #   4. drop the xe driver from the build, build i915 + intel_sriov_compat
 #   5. package them into i915-sriov-<ver>-<kernel>-Unraid-<build>.txz + md5
 #
@@ -21,8 +21,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/package-version.sh"
 
 # ---------- config (overridable via environment) ----------
-TARGET_KERNEL_VERSION="${TARGET_KERNEL_VERSION:-6.18.44}"
-KERNEL_RELEASE="${KERNEL_RELEASE:-${TARGET_KERNEL_VERSION}-Unraid}"
+KERNEL_RELEASE="${KERNEL_RELEASE:-${TARGET_KERNEL_VERSION:-6.18.58}-Unraid}"
+TARGET_KERNEL_VERSION="${TARGET_KERNEL_VERSION:-${KERNEL_RELEASE%-Unraid}}"
 JOBS="${JOBS:-$(nproc --all)}"
 KERNEL_ARCHIVE_URL="${KERNEL_ARCHIVE_URL:-https://github.com/ich777/unraid_kernel/releases/download/${KERNEL_RELEASE}/linux-${KERNEL_RELEASE}.tar.xz}"
 # Per-release SHA256 of the ich777 kernel archive; unknown releases fall back
@@ -34,6 +34,7 @@ case "${KERNEL_RELEASE}" in
   6.18.47-Unraid) DEFAULT_KERNEL_SHA256="72822aea43a7d6dab3ae7a8489481a583504896927c1ce7117df8ab1b46d173f" ;;
   6.18.52-Unraid) DEFAULT_KERNEL_SHA256="5b61827a519d14af6cbfc16b7fdb22847094d2ae2a27764b2335b9a1b631431f" ;;
   6.18.54-Unraid) DEFAULT_KERNEL_SHA256="5c8795f9c7a60a01f7135018d0339466f180c7d2bef6f2b35bae8711783c6e00" ;;
+  6.18.58-Unraid) DEFAULT_KERNEL_SHA256="da2ae45037a7f8049bbc9eeb306cf5385f59216c8c055c6ee827d243b016e962" ;;
   *)              DEFAULT_KERNEL_SHA256="" ;;
 esac
 KERNEL_ARCHIVE_SHA256="${KERNEL_ARCHIVE_SHA256:-${DEFAULT_KERNEL_SHA256}}"
@@ -66,6 +67,9 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $
 kmake() {
   make -C "$KERNEL_DIR" CC="$CC" HOSTCC="$HOSTCC" CXX="$CXX" HOSTCXX="$HOSTCXX" "$@"
 }
+
+need_cmd "$CC"
+COMPILER_VERSION="$("$CC" --version | head -1)"
 
 # ---------- 1. kernel source tree ----------
 log "Fetching ich777 kernel tree ${KERNEL_RELEASE}"
@@ -116,13 +120,18 @@ PKG_NAME="i915-sriov-${PKG_VERSION}-${KERNEL_RELEASE}-${PACKAGE_BUILD}"
   log "Upstream date: $SOURCE_DATE (UTC)"
   log "Package version: $PKG_VERSION"
   log "Package: ${PKG_NAME}.txz"
+  log "Compiler: $COMPILER_VERSION"
 } 2>&1 | tee "$OUT_DIR/build-i915.log"
 
-# ---------- 3. Unraid slab-compat patch ----------
-PATCH="$ROOT_DIR/patches/strongtz-2026.08.08-unraid-6x-slab.patch"
-log "Applying Unraid slab-compat patch"
-git -C "$I915_DIR" apply --check "$PATCH"
-git -C "$I915_DIR" apply "$PATCH"
+# ---------- 3. Unraid compatibility patches ----------
+for patch_name in \
+  strongtz-2026.08.08-unraid-6x-slab.patch \
+  strongtz-master-drm-client-event-conftest.patch; do
+  PATCH="$ROOT_DIR/patches/$patch_name"
+  log "Applying $patch_name"
+  git -C "$I915_DIR" apply --check "$PATCH"
+  git -C "$I915_DIR" apply "$PATCH"
+done
 
 # i915-only route: drop the xe driver from the build entirely (like giganode).
 # xe does not support MTL/LNL anyway and conflicts with the i915 setup.
@@ -198,6 +207,7 @@ md5sum "$OUT_DIR/${PKG_NAME}.txz" > "$OUT_DIR/${PKG_NAME}.txz.md5"
   echo "upstream date:   $SOURCE_DATE (UTC)"
   echo "package version: $PKG_VERSION"
   echo "package file:    ${PKG_NAME}.txz"
+  echo "compiler:        $COMPILER_VERSION"
   echo "i915 module:     $(modinfo -F version "$I915_DIR/drivers/gpu/drm/i915/i915.ko" | head -1)"
   echo "vermagic:        $vermagic"
   echo "max_vfs:         $I915_MAX_VFS"

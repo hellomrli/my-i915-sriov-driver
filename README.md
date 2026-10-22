@@ -4,6 +4,8 @@
 
 配合 [my-unraid-vgpu-manager](https://github.com/hellomrli/my-unraid-vgpu-manager) 插件使用——插件负责下载本包、安装并管理 VF（虚拟功能）供虚拟机直通。
 
+自动构建始终跟踪上游 **master**，即 **2026.09.16 系列及其后续 master 更新**，不固定在 9.16 tag，也不为兼容内核而回退到旧驱动分支。当前模块版本仍是 `2026.09.16-sriov`。上游 `dkms.conf` 的内核匹配范围为 `6.17.x ~ 7.2.x`（README 目前标注 `6.18.x ~ 7.2.x`）；这里使用的就是这条开发线。
+
 打包方式参照 [giganode/unraid-i915-sriov](https://github.com/giganode/unraid-i915-sriov)：**只走 i915 路线**。
 
 ## 功能
@@ -11,24 +13,24 @@
 - 在 Intel iGPU（支持 SR-IOV 的型号）上启用虚拟功能（VF）
 - 每个 VF 可作为一个独立 GPU 直通给虚拟机
 - 跟踪 strongtz 上游 **master HEAD**（而非 release tag），第一时间包含最新补丁（如 VF/PF 安全加固、内核同步）
-- 包含 Unraid 6.x 内核的 slab 兼容补丁
+- 包含 Unraid 6.x 内核的 slab 兼容补丁与 DRM client-event 接口编译探测
 
 ## 编译的模块（i915-only）
 
 - `i915.ko` — 带 SR-IOV 支持的 i915 驱动
 - `intel_sriov_compat.ko` — SR-IOV 兼容层
 
-不编译、不分发 `xe.ko`（对 MTL/LNL 支持不佳且与 i915 路线冲突）与 `kvmgt.ko`（GVT-g，本项目不使用）。
+从构建中剔除 `xe.ko`（对 MTL/LNL 支持不佳且与 i915 路线冲突），也不分发 `kvmgt.ko`（GVT-g，本项目不使用）。包内仅包含上面两个模块。
 
 ## 版本号规则
 
 包版本号默认取**实际检出的上游提交的 committer 日期（UTC）**，格式为 `YYYY.MM.DD`，例如：
 
 ```
-i915-sriov-2026.10.02-6.18.54-Unraid-1.txz   (+ .md5)
+i915-sriov-2026.10.02-6.18.58-Unraid-1.txz   (+ .md5)
 ```
 
-即「基于 strongtz 2026-10-02（UTC）的源码快照、面向 6.18.54-Unraid 内核」。月份和日期保留前导零；使用同一份源码在其他日期重新编译，默认版本号不变。需要区分同日重打包时可增加 `PACKAGE_BUILD`。
+即「基于 strongtz 2026-10-02（UTC）的源码快照、面向 6.18.58-Unraid 内核」。月份和日期保留前导零；使用同一份源码在其他日期重新编译，默认版本号不变。需要区分同日重打包时可增加 `PACKAGE_BUILD`。
 
 包日期不是上游 DKMS/模块的版本号。例如 2026-10-02 的源码仍可能声明 `2026.09.16-sriov`，本项目保留该模块版本，只规范包名中的日期。精确源码 SHA、UTC 日期及包版本会分别记录到 `out/build-i915.log` 和 `out/i915-installed-modules.txt`。
 
@@ -38,21 +40,24 @@ i915-sriov-2026.10.02-6.18.54-Unraid-1.txz   (+ .md5)
 
 `.github/workflows/build.yml` 执行 `scripts/build-i915-sriov.sh`：
 
-- **手动触发**：运行 *Build i915 SR-IOV driver* 工作流。`i915_ref` 留空/`latest` 时使用上游 master HEAD，也可填指定 tag/分支/SHA；所有 ref 均先解析为精确 SHA，再用该 SHA 构建和校验，保留 tag 的 `v` 前缀。`kernel_release` 留空则自动取 [ich777/unraid_kernel](https://github.com/ich777/unraid_kernel) 最新内核
-- **每日自动检查**：每天 03:30（UTC）解析上游 master HEAD 与 ich777 最新内核，**只有当上游快照日期或内核版本出现新组合时才编译**，否则跳过
-- 自动下载 ich777 预编译内核源码树（已知版本校验 SHA256），应用 Unraid slab 补丁后，剔除 xe 再编译
+- **手动触发**：运行 *Build i915 SR-IOV driver* 工作流。驱动始终解析当前上游 `master` HEAD 为精确 SHA 后构建和校验，不提供旧分支或 tag 选择项。`kernel_release` 留空则自动取 [ich777/unraid_kernel](https://github.com/ich777/unraid_kernel) 最新内核
+- **每日自动检查**：每天 03:30（UTC）解析上游 master HEAD 与 ich777 最新内核。通过目标内核 Release 正文记下已构建的精确上游 SHA，**只有同一 SHA 已构建时才跳过**；master 即使在相同 UTC 日期有新提交，也会触发构建并更新对应包
+- 工具链使用固定的官方 **`gcc:16.2.0`** 镜像；先运行离线回归测试，再构建模块
+- 自动下载 ich777 预编译内核源码树（已知版本校验 SHA256），应用 Unraid slab 与 DRM 接口兼容补丁后，剔除 xe 再编译
 
-构建产物附加到 **tag 等于内核版本** 的 Release（如 `6.18.54-Unraid`、`6.18.52-Unraid`）。
+构建产物附加到 **tag 等于内核版本** 的 Release（如 `6.18.58-Unraid`）。
+
+`6.18.58-Unraid` 已回移 `drm_client_dev_suspend/resume()` 的单参数接口，不能仅用 `>= 6.19` 判断签名。兼容补丁在上游现有 conftest 流程中分别编译探测这两个接口，再选择对应调用方式，不更换驱动分支。内核自身由 GCC 14.2 构建时，使用 GCC 16.2 编译外部模块仍会显示编译器不一致警告；该警告不等同于编译失败，实际编译器版本会记录到构建日志和模块清单。
 
 ## 本地构建
 
 ```bash
-# 需要 Linux 环境，装有 gcc/make/git/curl/tar/xz
-# 默认取上游 master HEAD，面向 6.18.54-Unraid：
-KERNEL_RELEASE=6.18.54-Unraid ./scripts/build-i915-sriov.sh
+# 需要 Linux 环境、GCC >= 14 及 make/git/curl/tar/xz/kmod 等构建依赖
+# 默认取上游 master HEAD，面向 6.18.58-Unraid：
+KERNEL_RELEASE=6.18.58-Unraid ./scripts/build-i915-sriov.sh
 ```
 
-可用环境变量：`I915_SRIOV_REF`（上游 ref，默认 `master`）、`KERNEL_RELEASE`、`PACKAGE_BUILD`、`PACKAGE_VERSION`（覆盖日期版本号）等。
+可用环境变量：`KERNEL_RELEASE`、`PACKAGE_BUILD`、`PACKAGE_VERSION`（覆盖日期版本号）等。默认始终构建 strongtz 最新 `master`；若要复现某一已审查的历史 master 提交，可用 `I915_SRIOV_REF` / `I915_SRIOV_COMMIT` 传入精确 SHA，不要切换旧内核分支。
 
 ## Release
 
@@ -66,4 +71,4 @@ KERNEL_RELEASE=6.18.54-Unraid ./scripts/build-i915-sriov.sh
 python3 -m unittest discover -s tests -v
 ```
 
-测试日期归一化、UTC 来源、CI ref 固定及模拟构建的产物命名；不下载内核，不代表真实驱动编译或 Unraid 硬件验证。
+测试日期归一化、UTC 来源、CI ref 固定、模拟构建的产物命名，以及真实 GCC 编译探测下的 DRM 单参数/双参数接口（包含 `6.18` 回移与 `7.2` 接口）。DRM 测试需要 GCC，缺失时会跳过；不下载内核，不代表完整驱动编译或 Unraid 硬件验证。

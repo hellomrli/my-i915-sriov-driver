@@ -1,0 +1,79 @@
+diff --git a/Makefile b/Makefile
+index 6322cc0..9b5b84b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -21,6 +21,8 @@ CONFTEST_H := $(obj)/$(CONFTEST_DIR)/results.h
+ 
+ CONFTEST_COMPILE_TESTS := \
+ 	copy_from_user_inatomic_nontemporal \
++	drm_client_dev_resume_1arg \
++	drm_client_dev_suspend_1arg \
+ 	drm_exec_for_each_locked_object_no_index \
+ 	drm_fb_helper_alloc_info \
+ 	drm_pagemap_compound_folio \
+diff --git a/conftest.sh b/conftest.sh
+index f2416f2..d02f910 100755
+--- a/conftest.sh
++++ b/conftest.sh
+@@ -75,6 +75,30 @@ ct_copy_from_user_inatomic_nontemporal() {
+ 	compile_check "$CODE" "IDB_COPY_FROM_USER_INATOMIC_NONTEMPORAL" 1
+ }
+ 
++ct_drm_client_dev_resume_1arg() {
++	CODE="
++	#include <drm/drm_client_event.h>
++	static void conftest_drm_client_dev_resume_1arg(void)
++	{
++		drm_client_dev_resume((struct drm_device *)0);
++	}
++	"
++
++	compile_check "$CODE" "IDB_DRM_CLIENT_DEV_RESUME_1ARG" 1
++}
++
++ct_drm_client_dev_suspend_1arg() {
++	CODE="
++	#include <drm/drm_client_event.h>
++	static void conftest_drm_client_dev_suspend_1arg(void)
++	{
++		drm_client_dev_suspend((struct drm_device *)0);
++	}
++	"
++
++	compile_check "$CODE" "IDB_DRM_CLIENT_DEV_SUSPEND_1ARG" 1
++}
++
+ ct_pci_resize_resource_4args() {
+ 	CODE="
+ 	#include <linux/pci.h>
+diff --git a/drivers/gpu/drm/i915/i915_driver.c b/drivers/gpu/drm/i915/i915_driver.c
+index 56360aa..17c123f 100644
+--- a/drivers/gpu/drm/i915/i915_driver.c
++++ b/drivers/gpu/drm/i915/i915_driver.c
+@@ -1086,7 +1086,7 @@ void i915_driver_shutdown(struct drm_i915_private *i915)
+ 	intel_runtime_pm_disable(&i915->runtime_pm);
+ 	intel_display_power_disable(display);
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
++#ifdef IDB_DRM_CLIENT_DEV_SUSPEND_1ARG
+ 	drm_client_dev_suspend(&i915->drm);
+ #else
+ 	drm_client_dev_suspend(&i915->drm, false);
+@@ -1176,7 +1176,7 @@ static int i915_drm_suspend(struct drm_device *dev)
+ 	 * properly. */
+ 	intel_display_power_disable(display);
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
++#ifdef IDB_DRM_CLIENT_DEV_SUSPEND_1ARG
+ 	drm_client_dev_suspend(dev);
+ #else
+ 	drm_client_dev_suspend(dev, false);
+@@ -1398,7 +1398,7 @@ static int i915_drm_resume(struct drm_device *dev)
+ 
+ 	intel_opregion_resume(display);
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
++#ifdef IDB_DRM_CLIENT_DEV_RESUME_1ARG
+ 	drm_client_dev_resume(dev);
+ #else
+ 	drm_client_dev_resume(dev, false);
