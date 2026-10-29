@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_release:
-        description: 'Unraid kernel release to build for (e.g. 6.18.44-Unraid), or "latest" to auto-detect from ich777/unraid_kernel'
+        description: 'Primary Unraid kernel release, or "latest" to auto-detect; also builds 6.18.58-Unraid'
         required: false
         default: 'latest'
         type: string
@@ -25,36 +25,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  resolve:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    container:
-      # Pin the current stable GCC, independently of the kernel's compiler.
-      # Newer Unraid kernels require -fmin-function-alignment (gcc >= 14).
-      image: gcc:16.2.0
+    timeout-minutes: 10
+    outputs:
+      i915_ref: ${{ steps.resolve.outputs.i915_ref }}
+      pkg_version: ${{ steps.resolve.outputs.pkg_version }}
+      kernel_releases: ${{ steps.resolve_kernel.outputs.kernel_releases }}
     env:
-      DEBIAN_FRONTEND: noninteractive
       TZ: UTC
     steps:
       - name: Check out source
         uses: actions/checkout@v5
-
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            bc bison build-essential ca-certificates curl flex git jq kmod \
-            libelf-dev make python3 tar xz-utils
-          rm -rf /var/lib/apt/lists/*
-          gcc --version | head -1
-          nproc
-
-      - name: Test build tooling
-        shell: bash
-        run: |
-          bash -n scripts/*.sh
-          python3 -m unittest discover -s tests -v
 
       - name: Resolve i915 ref
         id: resolve
@@ -90,19 +72,63 @@ jobs:
           if [ "$kr" = "latest" ]; then
             # fetch the newest ich777 Unraid kernel release tag
             kr="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/ich777/unraid_kernel/releases/latest \
-              | jq -r '.tag_name')"
+              | jq -er '.tag_name | select(type == "string")')"
           fi
+          [[ "$kr" =~ ^[0-9]+\.[0-9]+\.[0-9]+-Unraid$ ]] || {
+            echo "Invalid Unraid kernel release: $kr" >&2
+            exit 1
+          }
+          kernels="$(jq -cn --arg primary "$kr" '[$primary, "6.18.58-Unraid"] | unique')"
           echo "kernel_release=$kr" >> "$GITHUB_OUTPUT"
+          echo "kernel_releases=$kernels" >> "$GITHUB_OUTPUT"
           echo "Resolved Unraid kernel release: $kr"
+          echo "Build kernel matrix: $kernels"
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel_release: ${{ fromJSON(needs.resolve.outputs.kernel_releases) }}
+    name: Build ${{ matrix.kernel_release }}
+    container:
+      # Pin the current stable GCC, independently of the kernel's compiler.
+      # Newer Unraid kernels require -fmin-function-alignment (gcc >= 14).
+      image: gcc:16.2.0
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TZ: UTC
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates curl flex git jq kmod \
+            libelf-dev make python3 tar xz-utils
+          rm -rf /var/lib/apt/lists/*
+          gcc --version | head -1
+          nproc
+
+      - name: Test build tooling
+        shell: bash
+        run: |
+          bash -n scripts/*.sh
+          python3 -m unittest discover -s tests -v
 
       - name: Check if this version is already built
         id: check
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KERNEL_RELEASE: ${{ steps.resolve_kernel.outputs.kernel_release }}
-          I915_REF: ${{ steps.resolve.outputs.i915_ref }}
-          PKG_VERSION: ${{ steps.resolve.outputs.pkg_version }}
+          KERNEL_RELEASE: ${{ matrix.kernel_release }}
+          I915_REF: ${{ needs.resolve.outputs.i915_ref }}
+          PKG_VERSION: ${{ needs.resolve.outputs.pkg_version }}
         run: |
           set -euo pipefail
           # 手动触发永远编译；只有定时任务才做“有新版本才编译”的判断
@@ -138,11 +164,10 @@ jobs:
         if: steps.check.outputs.new_version == 'true'
         shell: bash
         env:
-          I915_SRIOV_REF: ${{ steps.resolve.outputs.i915_ref }}
-          I915_SRIOV_COMMIT: ${{ steps.resolve.outputs.i915_ref }}
-          KERNEL_RELEASE: ${{ steps.resolve_kernel.outputs.kernel_release }}
-          TARGET_KERNEL_VERSION: ${{ steps.resolve_kernel.outputs.kernel_release }}
-          PACKAGE_VERSION: ${{ steps.resolve.outputs.pkg_version }}
+          I915_SRIOV_REF: ${{ needs.resolve.outputs.i915_ref }}
+          I915_SRIOV_COMMIT: ${{ needs.resolve.outputs.i915_ref }}
+          KERNEL_RELEASE: ${{ matrix.kernel_release }}
+          PACKAGE_VERSION: ${{ needs.resolve.outputs.pkg_version }}
           PACKAGE_BUILD: ${{ inputs.package_build }}
         run: |
           set -euo pipefail
@@ -155,9 +180,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KERNEL_RELEASE: ${{ steps.resolve_kernel.outputs.kernel_release }}
-          I915_REF: ${{ steps.resolve.outputs.i915_ref }}
-          PKG_VERSION: ${{ steps.resolve.outputs.pkg_version }}
+          KERNEL_RELEASE: ${{ matrix.kernel_release }}
+          I915_REF: ${{ needs.resolve.outputs.i915_ref }}
+          PKG_VERSION: ${{ needs.resolve.outputs.pkg_version }}
         run: |
           set -euo pipefail
           pkg="$(ls out/i915-sriov-*.txz | head -1)"

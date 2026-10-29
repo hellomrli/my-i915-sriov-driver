@@ -9,6 +9,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 PATCH = ROOT / "patches/strongtz-master-drm-client-event-conftest.patch"
 CC = shutil.which("gcc")
+FIXTURES = ROOT / "tests/fixtures/drm-client-event"
 
 MAKEFILE = r"""
 CONFTEST_COMPILE_TESTS := \
@@ -109,7 +110,7 @@ class DrmClientEventTests(unittest.TestCase):
                 "#endif",
             ])
         (self.include / "drm/drm_client_event.h").write_text(
-            "#include <stdbool.h>\n#include <linux/version.h>\n"
+            "#include <stdbool.h>\n#include <stddef.h>\n#include <linux/version.h>\n"
             "struct drm_device;\n" + "\n".join(declarations) + "\n"
         )
         self.cflags = "-std=gnu11" + (" -DCONFIG_DRM_CLIENT=1" if enabled else "")
@@ -171,6 +172,44 @@ class DrmClientEventTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("too many arguments", result.stderr)
+
+    def test_upstream_2026_10_28_probe_and_relocated_calls(self):
+        conftest = (FIXTURES / "conftest.sh").read_text()
+        probe = (FIXTURES / "upstream-one-arg.sh").read_text()
+        (self.directory / "conftest.sh").write_text(conftest.replace(
+            "ct_pci_resize_resource_4args() {",
+            probe + "\nct_pci_resize_resource_4args() {",
+        ))
+        self.driver.write_bytes((FIXTURES / "upstream-display-driver.c").read_bytes())
+        for version, args, enabled in (
+            ((6, 18, 58), 1, True),
+            ((6, 18, 59), 1, True),
+            ((7, 3, 0), 1, True),
+            ((6, 18, 54), 2, True),
+            ((6, 18, 58), 1, False),
+        ):
+            with self.subTest(version=version, args=args, enabled=enabled):
+                self.headers(version, args, args, enabled)
+                result = subprocess.run(
+                    ["sh", "conftest.sh", "compile_test", "drm_client_dev_suspend_one_arg"],
+                    cwd=self.directory,
+                    env={**os.environ, "CC": CC, "srctree": str(self.directory),
+                         "LINUXINCLUDE": f"-I{self.include}", "KBUILD_CFLAGS": self.cflags},
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                macro = "IDB_DRM_CLIENT_DEV_SUSPEND_ONE_ARG"
+                expected = f"#define {macro} 1" if args == 1 else f"#undef {macro}"
+                self.assertIn(expected, result.stdout)
+                results = self.directory / "results.h"
+                results.write_text(result.stdout)
+                compiled = subprocess.run(
+                    [CC, *self.cflags.split(), f"-I{self.include}", "-include", str(results),
+                     "-Werror=implicit-function-declaration", "-fsyntax-only", str(self.driver)],
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
 
 if __name__ == "__main__":

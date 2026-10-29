@@ -35,6 +35,7 @@ case "${KERNEL_RELEASE}" in
   6.18.52-Unraid) DEFAULT_KERNEL_SHA256="5b61827a519d14af6cbfc16b7fdb22847094d2ae2a27764b2335b9a1b631431f" ;;
   6.18.54-Unraid) DEFAULT_KERNEL_SHA256="5c8795f9c7a60a01f7135018d0339466f180c7d2bef6f2b35bae8711783c6e00" ;;
   6.18.58-Unraid) DEFAULT_KERNEL_SHA256="da2ae45037a7f8049bbc9eeb306cf5385f59216c8c055c6ee827d243b016e962" ;;
+  6.18.59-Unraid) DEFAULT_KERNEL_SHA256="1d7d9d052fae45c33651b686b161ec1a41fa928f3655f181e760d155d22f9d4e" ;;
   *)              DEFAULT_KERNEL_SHA256="" ;;
 esac
 KERNEL_ARCHIVE_SHA256="${KERNEL_ARCHIVE_SHA256:-${DEFAULT_KERNEL_SHA256}}"
@@ -124,14 +125,32 @@ PKG_NAME="i915-sriov-${PKG_VERSION}-${KERNEL_RELEASE}-${PACKAGE_BUILD}"
 } 2>&1 | tee "$OUT_DIR/build-i915.log"
 
 # ---------- 3. Unraid compatibility patches ----------
-for patch_name in \
-  strongtz-2026.08.08-unraid-6x-slab.patch \
-  strongtz-master-drm-client-event-conftest.patch; do
-  PATCH="$ROOT_DIR/patches/$patch_name"
+apply_compat_patch() {
+  local patch_name="$1"
+  local patch="$ROOT_DIR/patches/$patch_name"
   log "Applying $patch_name"
-  git -C "$I915_DIR" apply --check "$PATCH"
-  git -C "$I915_DIR" apply "$PATCH"
-done
+  git -C "$I915_DIR" apply --check "$patch"
+  git -C "$I915_DIR" apply "$patch"
+}
+
+has_upstream_drm_client_compat() {
+  local driver="$I915_DIR/drivers/gpu/drm/i915/display/intel_display_driver.c"
+  [ -f "$I915_DIR/conftest.sh" ] && [ -f "$driver" ] &&
+    grep -Eq '^[[:space:]]+drm_client_dev_suspend_one_arg([[:space:]]|$)' "$I915_DIR/Makefile" &&
+    grep -Fq 'compile_check "$CODE" "IDB_DRM_CLIENT_DEV_SUSPEND_ONE_ARG" 1' "$I915_DIR/conftest.sh" &&
+    [ "$(grep -c '^#ifdef IDB_DRM_CLIENT_DEV_SUSPEND_ONE_ARG$' "$driver")" -ge 2 ]
+}
+
+{
+  apply_compat_patch strongtz-2026.08.08-unraid-6x-slab.patch
+  # Upstream 2026.10.28 probes both calls and moves them to the display driver.
+  # Only skip our old patch when the registered probe and its callers exist.
+  if has_upstream_drm_client_compat; then
+    log "Using upstream DRM client-event compatibility; skipping legacy DRM patch"
+  else
+    apply_compat_patch strongtz-master-drm-client-event-conftest.patch
+  fi
+} 2>&1 | tee -a "$OUT_DIR/build-i915.log"
 
 # i915-only route: drop the xe driver from the build entirely (like giganode).
 # xe does not support MTL/LNL anyway and conflicts with the i915 setup.

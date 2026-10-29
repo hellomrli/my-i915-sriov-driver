@@ -4,7 +4,7 @@
 
 配合 [my-unraid-vgpu-manager](https://github.com/hellomrli/my-unraid-vgpu-manager) 插件使用——插件负责下载本包、安装并管理 VF（虚拟功能）供虚拟机直通。
 
-自动构建始终跟踪上游 **master**，即 **2026.09.16 系列及其后续 master 更新**，不固定在 9.16 tag，也不为兼容内核而回退到旧驱动分支。当前模块版本仍是 `2026.09.16-sriov`。上游 `dkms.conf` 的内核匹配范围为 `6.17.x ~ 7.2.x`（README 目前标注 `6.18.x ~ 7.2.x`）；这里使用的就是这条开发线。
+自动构建始终跟踪上游 **master**，不固定在 release tag，也不为兼容内核而回退到旧驱动分支。当前上游快照为 **2026.10.28**，模块版本为 `2026.10.28-sriov`，上游 `dkms.conf` 与 README 的内核范围均为 `6.18.x ~ 7.3.x`。
 
 打包方式参照 [giganode/unraid-i915-sriov](https://github.com/giganode/unraid-i915-sriov)：**只走 i915 路线**。
 
@@ -40,14 +40,16 @@ i915-sriov-2026.10.02-6.18.58-Unraid-1.txz   (+ .md5)
 
 `.github/workflows/build.yml` 执行 `scripts/build-i915-sriov.sh`：
 
-- **手动触发**：运行 *Build i915 SR-IOV driver* 工作流。驱动始终解析当前上游 `master` HEAD 为精确 SHA 后构建和校验，不提供旧分支或 tag 选择项。`kernel_release` 留空则自动取 [ich777/unraid_kernel](https://github.com/ich777/unraid_kernel) 最新内核
-- **每日自动检查**：每天 03:30（UTC）解析上游 master HEAD 与 ich777 最新内核。通过目标内核 Release 正文记下已构建的精确上游 SHA，**只有同一 SHA 已构建时才跳过**；master 即使在相同 UTC 日期有新提交，也会触发构建并更新对应包
+- **手动触发**：运行 *Build i915 SR-IOV driver* 工作流。驱动始终解析当前上游 `master` HEAD 为精确 SHA 后构建和校验，不提供旧分支或 tag 选择项。`kernel_release` 留空则自动取 [ich777/unraid_kernel](https://github.com/ich777/unraid_kernel) 最新内核，同时始终构建 **`6.18.58-Unraid`**；显式指定 6.18.58 时会去重，只构建一次
+- **每日自动检查**：每天 03:30（UTC）解析一次上游 master HEAD，供最新内核与 `6.18.58-Unraid` 两个构建共享。每个内核分别通过对应 Release 正文记下已构建的精确上游 SHA，**只有同一 SHA 的包和 MD5 均存在时才跳过**；一个内核构建失败不会取消另一个
 - 工具链使用固定的官方 **`gcc:16.2.0`** 镜像；先运行离线回归测试，再构建模块
-- 自动下载 ich777 预编译内核源码树（已知版本校验 SHA256），应用 Unraid slab 与 DRM 接口兼容补丁后，剔除 xe 再编译
+- 自动下载 ich777 预编译内核源码树（已知版本校验 SHA256），应用 Unraid slab 兼容补丁；DRM 接口优先使用上游已有探测，旧快照仍应用本地补丁，剔除 xe 后再编译
 
 构建产物附加到 **tag 等于内核版本** 的 Release（如 `6.18.58-Unraid`）。
 
-`6.18.58-Unraid` 已回移 `drm_client_dev_suspend/resume()` 的单参数接口，不能仅用 `>= 6.19` 判断签名。兼容补丁在上游现有 conftest 流程中分别编译探测这两个接口，再选择对应调用方式，不更换驱动分支。内核自身由 GCC 14.2 构建时，使用 GCC 16.2 编译外部模块仍会显示编译器不一致警告；该警告不等同于编译失败，实际编译器版本会记录到构建日志和模块清单。
+`6.18.58-Unraid` 已回移 `drm_client_dev_suspend/resume()` 的单参数接口，不能仅用 `>= 6.19` 判断签名。上游 2026.10.28 已加入 `drm_client_dev_suspend_one_arg` 探测，并把调用移动到 `display/intel_display_driver.c`，因此旧 DRM 补丁不能再无条件应用。脚本确认探测注册、宏生成逻辑和新调用位置后，跳过旧补丁；未识别的源码仍严格校验补丁，不忽略应用失败。旧快照继续使用分别探测两个接口的本地补丁，不更换驱动分支。
+
+内核自身由 GCC 14.2 构建时，使用 GCC 16.2 编译外部模块仍会显示编译器不一致警告；该警告不等同于编译失败，实际编译器版本会记录到构建日志和模块清单。
 
 ## 本地构建
 
@@ -71,4 +73,4 @@ KERNEL_RELEASE=6.18.58-Unraid ./scripts/build-i915-sriov.sh
 python3 -m unittest discover -s tests -v
 ```
 
-测试日期归一化、UTC 来源、CI ref 固定、模拟构建的产物命名，以及真实 GCC 编译探测下的 DRM 单参数/双参数接口（包含 `6.18` 回移与 `7.2` 接口）。DRM 测试需要 GCC，缺失时会跳过；不下载内核，不代表完整驱动编译或 Unraid 硬件验证。
+测试日期归一化、UTC 来源、CI ref 固定、双内核矩阵及去重、模拟构建的产物命名，以及真实 GCC 编译探测下的 DRM 单参数/双参数接口（包含 `6.18.58/59` 回移与 `7.3` 接口）。同时验证新版上游跳过旧 DRM 补丁、旧快照继续应用补丁，以及不完整探测不会被静默忽略。DRM 测试需要 GCC，缺失时会跳过；不下载内核，不代表完整驱动编译或 Unraid 硬件验证。

@@ -139,7 +139,7 @@ exit "${MOCK_STATUS:-0}"
         self.assertTrue(requests[0].endswith("/commits/master"), requests)
         self.assertIn("2026.10.02 UTC", result.stdout)
         workflow = (ROOT / ".github/workflows/build.yml").read_text()
-        self.assertNotIn("i915_ref:", workflow)
+        self.assertNotIn("i915_ref:", workflow.split("jobs:\n", 1)[0])
         self.assertIn("ref=master", workflow_step("Resolve i915 ref"))
 
     def test_bad_api_data_is_rejected_before_outputs(self):
@@ -164,13 +164,87 @@ exit "${MOCK_STATUS:-0}"
         build_step = workflow.split("      - name: Build i915 SR-IOV package\n", 1)[1]
         build_step = build_step.split("      - name:", 1)[0]
         for variable in ("I915_SRIOV_REF", "I915_SRIOV_COMMIT"):
-            self.assertIn(f"{variable}: ${{{{ steps.resolve.outputs.i915_ref }}}}", build_step)
+            self.assertIn(f"{variable}: ${{{{ needs.resolve.outputs.i915_ref }}}}", build_step)
 
     def test_workflow_uses_gcc_16_and_runs_regressions(self):
         workflow = (ROOT / ".github/workflows/build.yml").read_text()
         self.assertIn("image: gcc:16.2.0", workflow)
         self.assertIn("python3 -m unittest discover -s tests -v",
                       workflow_step("Test build tooling"))
+
+
+class WorkflowKernelMatrixTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="i915-kernel-matrix-")
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.bin = self.directory / "bin"
+        self.bin.mkdir()
+        self.output = self.directory / "output"
+        self.requests = self.directory / "requests"
+        executable(self.bin / "curl", '''printf '%s\\n' "$*" >> "$MOCK_REQUESTS"
+printf '%s\\n' "$MOCK_RESPONSE"
+exit "${MOCK_STATUS:-0}"
+''')
+        self.env = {
+            **os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "GITHUB_OUTPUT": str(self.output), "MOCK_REQUESTS": str(self.requests),
+            "GH_TOKEN": "test-token",
+        }
+
+    def resolve(self, primary="", response=None, status="0"):
+        self.output.write_text("")
+        self.requests.write_text("")
+        return run(
+            ["bash", "-c", workflow_step("Resolve kernel release")], cwd=ROOT,
+            env={**self.env, "KERNEL_RELEASE_INPUT": primary, "MOCK_STATUS": status,
+                 "MOCK_RESPONSE": json.dumps(response if response is not None else
+                                             {"tag_name": "6.18.59-Unraid"})},
+        )
+
+    def outputs(self):
+        return dict(line.split("=", 1) for line in self.output.read_text().splitlines())
+
+    def test_latest_and_6_18_58_are_both_built(self):
+        result = self.resolve()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outputs = self.outputs()
+        self.assertEqual(outputs["kernel_release"], "6.18.59-Unraid")
+        self.assertEqual(json.loads(outputs["kernel_releases"]),
+                         ["6.18.58-Unraid", "6.18.59-Unraid"])
+        self.assertIn("Authorization: Bearer test-token", self.requests.read_text())
+
+    def test_explicit_6_18_58_is_not_duplicated(self):
+        result = self.resolve("6.18.58-Unraid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.outputs()["kernel_releases"]), ["6.18.58-Unraid"])
+        self.assertEqual(self.requests.read_text(), "")
+
+    def test_explicit_kernel_still_includes_6_18_58(self):
+        result = self.resolve("6.18.54-Unraid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.outputs()["kernel_releases"]),
+                         ["6.18.54-Unraid", "6.18.58-Unraid"])
+
+    def test_invalid_release_or_http_failure_has_no_outputs(self):
+        for primary, response, status in (
+            ("", {}, "0"), ("", {"tag_name": None}, "0"),
+            ("", {"tag_name": "null"}, "0"), ("", {}, "22"),
+            ("../6.18.58-Unraid", None, "0"), ("6.18.58", None, "0"),
+        ):
+            with self.subTest(primary=primary, response=response, status=status):
+                result = self.resolve(primary, response, status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.output.read_text(), "")
+
+    def test_matrix_shares_one_sha_and_does_not_cancel_other_kernel(self):
+        workflow = (ROOT / ".github/workflows/build.yml").read_text()
+        self.assertIn("needs: resolve", workflow)
+        self.assertIn("fail-fast: false", workflow)
+        self.assertIn("kernel_release: ${{ fromJSON(needs.resolve.outputs.kernel_releases) }}",
+                      workflow)
+        self.assertEqual(workflow.count("KERNEL_RELEASE: ${{ matrix.kernel_release }}"), 3)
+        self.assertNotIn("steps.resolve.outputs", workflow.split("  build:\n", 1)[1])
 
 
 class WorkflowDedupTests(unittest.TestCase):
@@ -367,7 +441,7 @@ class MockBuildTests(unittest.TestCase):
             'obj-m += compat/\nobj-m += drivers/gpu/drm/i915/\nobj-m += drivers/gpu/drm/xe/\n'
         )
         (self.source / "dkms.conf").write_text('PACKAGE_VERSION="2026.09.16"\n')
-        git_env = {
+        self.git_env = {
             **os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
             "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
@@ -379,7 +453,7 @@ class MockBuildTests(unittest.TestCase):
             ["init", "-q", "--initial-branch=master"], ["add", "."],
             ["-c", "commit.gpgsign=false", "commit", "-qm", "fixture"],
         ):
-            result = run(["git", "-C", str(self.source), *args], env=git_env)
+            result = run(["git", "-C", str(self.source), *args], env=self.git_env)
             self.assertEqual(result.returncode, 0, result.stderr)
         self.sha = run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True).stdout.strip()
         self.out = self.directory / "out"
@@ -431,7 +505,7 @@ esac
         return run(["bash", str(self.project / "scripts/build-i915-sriov.sh")],
                    env={**self.env, **overrides}, cwd=self.project)
 
-    def assert_package(self, version, build="1"):
+    def assert_package(self, version, build="1", fixture="compatible\n"):
         name = f"i915-sriov-{version}-6.18.54-Unraid-{build}.txz"
         package = self.out / name
         self.assertTrue(package.is_file(), name)
@@ -455,7 +529,7 @@ esac
             self.assertIn("./lib/modules/6.18.54-Unraid/kernel/drivers/gpu/drm/i915/i915.ko.xz", tar.getnames())
             self.assertIn("./lib/modules/6.18.54-Unraid/updates/compat/intel_sriov_compat.ko", tar.getnames())
         fetched = Path(self.env["BUILD_DIR"]) / "i915-sriov-dkms-master"
-        self.assertEqual((fetched / "fixture.txt").read_text(), "compatible\n")
+        self.assertEqual((fetched / "fixture.txt").read_text(), fixture)
         self.assertEqual((fetched / "dkms.conf").read_text(), 'PACKAGE_VERSION="2026.09.16"\n')
 
     def test_default_version_uses_actual_committer_utc_date(self):
@@ -495,6 +569,58 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("i915 commit mismatch", result.stderr)
         self.assertFalse(self.compiler_calls.exists())
+
+    def prepare_upstream_drm_compat(self):
+        makefile = self.source / "Makefile"
+        makefile.write_text(
+            'CONFTEST_COMPILE_TESTS := \\\n\tdrm_client_dev_suspend_one_arg \\\n\tother_probe\n' +
+            'DKMS_MODULE_VERSION := "2026.09.16-sriov"\n' +
+            'obj-m += compat/\nobj-m += drivers/gpu/drm/i915/\nobj-m += drivers/gpu/drm/xe/\n'
+        )
+        fixtures = ROOT / "tests/fixtures/drm-client-event"
+        shutil.copy2(fixtures / "upstream-one-arg.sh", self.source / "conftest.sh")
+        driver = self.source / "drivers/gpu/drm/i915/display/intel_display_driver.c"
+        driver.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(fixtures / "upstream-display-driver.c", driver)
+        shutil.copy2(ROOT / "patches/strongtz-master-drm-client-event-conftest.patch",
+                     self.project / "patches/strongtz-master-drm-client-event-conftest.patch")
+
+    def commit_source_changes(self):
+        for args in (["add", "."], ["-c", "commit.gpgsign=false", "commit", "-qm", "compat fixture"]):
+            result = run(["git", "-C", str(self.source), *args], env=self.git_env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.sha = run(["git", "-C", str(self.source), "rev-parse", "HEAD"], check=True).stdout.strip()
+        self.env["I915_SRIOV_COMMIT"] = self.sha
+
+    def test_upstream_drm_compat_skips_only_the_legacy_patch(self):
+        self.prepare_upstream_drm_compat()
+        self.commit_source_changes()
+        result = self.build()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_package("2026.10.02", fixture="after\n")
+        log = (self.out / "build-i915.log").read_text()
+        self.assertIn("Applying strongtz-2026.08.08-unraid-6x-slab.patch", log)
+        self.assertIn("Using upstream DRM client-event compatibility", log)
+        self.assertNotIn("Applying strongtz-master-drm-client-event-conftest.patch", log)
+
+    def test_incomplete_upstream_compat_is_not_silently_skipped(self):
+        for missing in ("registration", "probe", "caller"):
+            with self.subTest(missing=missing):
+                self.prepare_upstream_drm_compat()
+                if missing == "registration":
+                    path = self.source / "Makefile"
+                    path.write_text(path.read_text().replace("drm_client_dev_suspend_one_arg", "other"))
+                elif missing == "probe":
+                    (self.source / "conftest.sh").unlink()
+                else:
+                    path = self.source / "drivers/gpu/drm/i915/display/intel_display_driver.c"
+                    path.write_text(path.read_text().replace(
+                        "#ifdef IDB_DRM_CLIENT_DEV_SUSPEND_ONE_ARG", "#if 1", 1))
+                self.commit_source_changes()
+                result = self.build()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.compiler_calls.exists())
+                self.assertIn("patch does not apply", (self.out / "build-i915.log").read_text())
 
 
 if __name__ == "__main__":
