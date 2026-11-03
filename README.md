@@ -1,76 +1,44 @@
 # my-i915-sriov-driver
 
-为 **Unraid** 编译的 **Intel i915 SR-IOV 驱动**，基于 [strongtz/i915-sriov-dkms](https://github.com/strongtz/i915-sriov-dkms) **master 最新快照**构建，打包为可直接安装到 Unraid 服务器的 Slackware `.txz` 格式。
+为 **Unraid** 提供独立的 **i915 SR-IOV** 与 **xe SR-IOV** 驱动包，基于 [strongtz/i915-sriov-dkms](https://github.com/strongtz/i915-sriov-dkms)，配合 [my-unraid-vgpu-manager](https://github.com/hellomrli/my-unraid-vgpu-manager) 管理 Intel 核显虚拟功能（VF）及虚拟机直通。
 
-配合 [my-unraid-vgpu-manager](https://github.com/hellomrli/my-unraid-vgpu-manager) 插件使用——插件负责下载本包、安装并管理 VF（虚拟功能）供虚拟机直通。
+> [!IMPORTANT]
+> **默认、推荐使用 i915。xe 是供测试使用的实验性选项，不会自动替换 i915。**
 
-自动构建始终跟踪上游 **master**，不固定在 release tag，也不为兼容内核而回退到旧驱动分支。当前上游快照为 **2026.10.28**，模块版本为 `2026.10.28-sriov`，上游 `dkms.conf` 与 README 的内核范围均为 `6.18.x ~ 7.3.x`。
+## 安装管理插件
 
-打包方式参照 [giganode/unraid-i915-sriov](https://github.com/giganode/unraid-i915-sriov)：**只走 i915 路线**。
+**[打开插件安装文件（.plg）](https://github.com/hellomrli/my-unraid-vgpu-manager/raw/master/my-unraid-vgpu-manager.plg)**
 
-## 功能
+在 Unraid 的 **插件（Plugins）→ 安装插件（Install Plugin）** 中粘贴下面的地址。点击代码块右上角的**复制按钮**即可复制完整链接：
 
-- 在 Intel iGPU（支持 SR-IOV 的型号）上启用虚拟功能（VF）
-- 每个 VF 可作为一个独立 GPU 直通给虚拟机
-- 跟踪 strongtz 上游 **master HEAD**（而非 release tag），第一时间包含最新补丁（如 VF/PF 安全加固、内核同步）
-- 包含 Unraid 6.x 内核的 slab 兼容补丁与 DRM client-event 接口编译探测
-
-## 编译的模块（i915-only）
-
-- `i915.ko` — 带 SR-IOV 支持的 i915 驱动
-- `intel_sriov_compat.ko` — SR-IOV 兼容层
-
-从构建中剔除 `xe.ko`（对 MTL/LNL 支持不佳且与 i915 路线冲突），也不分发 `kvmgt.ko`（GVT-g，本项目不使用）。包内仅包含上面两个模块。
-
-## 版本号规则
-
-包版本号默认取**实际检出的上游提交的 committer 日期（UTC）**，格式为 `YYYY.MM.DD`，例如：
-
-```
-i915-sriov-2026.10.02-6.18.58-Unraid-1.txz   (+ .md5)
+```text
+https://github.com/hellomrli/my-unraid-vgpu-manager/raw/master/my-unraid-vgpu-manager.plg
 ```
 
-即「基于 strongtz 2026-10-02（UTC）的源码快照、面向 6.18.58-Unraid 内核」。月份和日期保留前导零；使用同一份源码在其他日期重新编译，默认版本号不变。需要区分同日重打包时可增加 `PACKAGE_BUILD`。
+Unraid 会通过 `.plg` 下载对应的插件安装包；后续在插件管理器中更新即可。安装插件后，打开 **设置 → Unraid vGPU 管理器 → 驱动管理**，选择并安装所需的 Intel 驱动。
 
-包日期不是上游 DKMS/模块的版本号。例如 2026-10-02 的源码仍可能声明 `2026.09.16-sriov`，本项目保留该模块版本，只规范包名中的日期。精确源码 SHA、UTC 日期及包版本会分别记录到 `out/build-i915.log` 和 `out/i915-installed-modules.txt`。
+## i915 还是 xe？
 
-显式设置 `PACKAGE_VERSION` 可以覆盖包日期，接受 `20261002`、`2026-10-02`、`2026.10.02` 三种写法，统一输出 `2026.10.02`；非法日历日期或其他版本字符串会使构建失败。覆盖值不会改变记录的真实源码日期。
+| 驱动 | 定位与建议 |
+|---|---|
+| **i915（默认、推荐）** | 保持本项目已有的使用路线；现有用户无需为上游 xe 更新而切换驱动。 |
+| **xe（实验性）** | Intel 较新的驱动架构，作为独立可选包提供，适合愿意验证硬件和客户机兼容性、能够排查及回退的用户。 |
 
-## 云编译（GitHub Actions）
+**xe 较新不等于在 Unraid SR-IOV 中一定更快、更稳定。** 主线驱动的普通图形支持与本项目使用的社区 SR-IOV 移植不是同一回事；应结合 GPU 型号、宿主内核、客户机驱动和实际负载判断，不能仅凭提交数量比较优劣。
 
-`.github/workflows/build.yml` 执行 `scripts/build-i915-sriov.sh`：
+两个包均来自社区实验性移植，并非 Intel 官方支持承诺。[上游说明](https://github.com/strongtz/i915-sriov-dkms#required-kernel-parameters)目前特别警告其 **xe 模块不支持 MTL（Meteor Lake）和 LNL（Lunar Lake）**；这不代表主线 xe 的支持情况，也不保证这些平台都能使用 i915 SR-IOV。
 
-- **手动触发**：运行 *Build i915 SR-IOV driver* 工作流。驱动始终解析当前上游 `master` HEAD 为精确 SHA 后构建和校验，不提供旧分支或 tag 选择项。`kernel_release` 留空则自动取 [ich777/unraid_kernel](https://github.com/ich777/unraid_kernel) 最新内核，同时始终构建 **`6.18.58-Unraid`**；显式指定 6.18.58 时会去重，只构建一次
-- **每日自动检查**：每天 03:30（UTC）解析一次上游 master HEAD，供最新内核与 `6.18.58-Unraid` 两个构建共享。每个内核分别通过对应 Release 正文记下已构建的精确上游 SHA，**只有同一 SHA 的包和 MD5 均存在时才跳过**；一个内核构建失败不会取消另一个
-- 工具链使用固定的官方 **`gcc:16.2.0`** 镜像；先运行离线回归测试，再构建模块
-- 自动下载 ich777 预编译内核源码树（已知版本校验 SHA256），应用 Unraid slab 兼容补丁；DRM 接口优先使用上游已有探测，旧快照仍应用本地补丁，剔除 xe 后再编译
+## 切换与回退
 
-构建产物附加到 **tag 等于内核版本** 的 Release（如 `6.18.58-Unraid`）。
+1. 在插件的 **驱动管理 → Intel SR-IOV 驱动** 中选择 i915 或 xe。已有配置和新安装均默认 i915；升级插件不会自动切换。
+2. 插件下载并校验独立驱动包、保留回退缓存，准备下次启动配置；**切换需要重启**，不会热切换正在使用的驱动或 VF。重启前可以取消切换。
+3. 测试 xe 前，关闭使用 GPU 的虚拟机和容器的自动启动。重启后先检查实际加载的驱动与 VF 直通，再启动工作负载；驱动启动失败不保证 Unraid 会阻止自动启动。
+4. 若测试异常，选择 i915 并再次重启回退。两个包共用兼容层，**不要手动同时安装**，也不要将物理功能（PF）直通给虚拟机。
 
-`6.18.58-Unraid` 已回移 `drm_client_dev_suspend/resume()` 的单参数接口，不能仅用 `>= 6.19` 判断签名。上游 2026.10.28 已加入 `drm_client_dev_suspend_one_arg` 探测，并把调用移动到 `display/intel_display_driver.c`，因此旧 DRM 补丁不能再无条件应用。脚本确认探测注册、宏生成逻辑和新调用位置后，跳过旧补丁；未识别的源码仍严格校验补丁，不忽略应用失败。旧快照继续使用分别探测两个接口的本地补丁，不更换驱动分支。
+安装驱动前，请卸载管理同一驱动的其他插件并重启。IOMMU、启动参数冲突、客户机驱动与具体操作见[管理插件中文说明](https://github.com/hellomrli/my-unraid-vgpu-manager/blob/master/README.zh-CN.md)。
 
-内核自身由 GCC 14.2 构建时，使用 GCC 16.2 编译外部模块仍会显示编译器不一致警告；该警告不等同于编译失败，实际编译器版本会记录到构建日志和模块清单。
+## 内核覆盖与更新
 
-## 本地构建
+只维护[当前 Unraid 正式版及公开测试版](https://docs.unraid.net/unraid-os/download_list/)在对应 [Release notes](https://docs.unraid.net/category/release-notes/) 中列出的内核，以及 [ich777 最新内核](https://github.com/ich777/unraid_kernel/releases/latest)，合并去重后分别提供两种驱动。ich777 内核用于提前准备即将发布的系统版本；退出这些来源的历史内核不再跟进更新，已有有效包保留。
 
-```bash
-# 需要 Linux 环境、GCC >= 14 及 make/git/curl/tar/xz/kmod 等构建依赖
-# 默认取上游 master HEAD，面向 6.18.58-Unraid：
-KERNEL_RELEASE=6.18.58-Unraid ./scripts/build-i915-sriov.sh
-```
-
-可用环境变量：`KERNEL_RELEASE`、`PACKAGE_BUILD`、`PACKAGE_VERSION`（覆盖日期版本号）等。默认始终构建 strongtz 最新 `master`；若要复现某一已审查的历史 master 提交，可用 `I915_SRIOV_REF` / `I915_SRIOV_COMMIT` 传入精确 SHA，不要切换旧内核分支。
-
-## Release
-
-此前已发布的构建包含 **20261002**（strongtz master，含 VF/PF 加固）for **6.18.52 / 6.18.54-Unraid**（tag 与内核版本一致）。更新后的流程生成 `2026.10.02` 形式的包名，不会自动重命名已有 Release 资产。
-
-历史构建还曾使用上游 tag 号（如 `2026.09.16`）。**紧凑日期与点分日期不能直接混用 `sort -V` 比较**：`20261002` 会排在 `2026.10.03` 后面。使用管理插件选择最新版时，应确认其先归一化两种日期格式；不能仅凭能解析文件名就保证排序正确。
-
-## 离线测试
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-测试日期归一化、UTC 来源、CI ref 固定、双内核矩阵及去重、模拟构建的产物命名，以及真实 GCC 编译探测下的 DRM 单参数/双参数接口（包含 `6.18.58/59` 回移与 `7.3` 接口）。同时验证新版上游跳过旧 DRM 补丁、旧快照继续应用补丁，以及不完整探测不会被静默忽略。DRM 测试需要 GCC，缺失时会跳过；不下载内核，不代表完整驱动编译或 Unraid 硬件验证。
+i915 与 xe 独立检查实际相关源码变化：仅 xe 更新不会重新发布未变化的 i915，文档等不参与构建的上游改动也不会触发无效更新；共享依赖或必要的兼容修复仍会更新受影响的驱动。

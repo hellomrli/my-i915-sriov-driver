@@ -1,20 +1,24 @@
-name: Build i915 SR-IOV driver for Unraid
+name: Build Intel SR-IOV drivers for Unraid
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_release:
-        description: 'Primary Unraid kernel release, or "latest" to auto-detect; also builds 6.18.58-Unraid'
+      driver:
+        description: 'Independent packages: i915 (recommended), xe (experimental), or both'
         required: false
-        default: 'latest'
-        type: string
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - i915
+          - xe
       package_build:
-        description: 'Package build number'
+        description: 'Package build number: auto increments; an explicit number must exceed existing builds'
         required: false
-        default: '1'
+        default: 'auto'
         type: string
   schedule:
-    # 每天定时检测上游 master SHA 与 ich777 最新内核；相同源码和内核才跳过。
+    # Compare each driver's effective inputs, local recipe, kernel and compiler.
     - cron: '30 3 * * *'
 
 permissions:
@@ -31,6 +35,8 @@ jobs:
     outputs:
       i915_ref: ${{ steps.resolve.outputs.i915_ref }}
       pkg_version: ${{ steps.resolve.outputs.pkg_version }}
+      source_fingerprints: ${{ steps.fingerprint.outputs.source_fingerprints }}
+      drivers: ${{ steps.fingerprint.outputs.drivers }}
       kernel_releases: ${{ steps.resolve_kernel.outputs.kernel_releases }}
     env:
       TZ: UTC
@@ -49,40 +55,50 @@ jobs:
           # Always build the newest supported driver line, including master
           # commits made after release 2026.09.16; never select legacy branches.
           ref=master
-          # Resolve the master head and its commit date from the same response.
+          # Resolve the commit, tree and date from the same response.
           encoded_ref="$(jq -rn --arg ref "$ref" '$ref | @uri')"
           commit="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "https://api.github.com/repos/strongtz/i915-sriov-dkms/commits/${encoded_ref}")"
           sha="$(jq -er '.sha | select(type == "string") | select(test("^[0-9a-f]{40}$"))' <<< "$commit")"
+          tree="$(jq -er '.commit.tree.sha | select(type == "string") | select(test("^[0-9a-f]{40}$"))' <<< "$commit")"
           timestamp="$(jq -er '.commit.committer.date | select(type == "string")' <<< "$commit")"
           cdate="$(snapshot_date_utc "$timestamp")"
           pkg_version="$(normalize_package_version "$cdate")"
           echo "i915_ref=$sha" >> "$GITHUB_OUTPUT"
+          echo "i915_tree=$tree" >> "$GITHUB_OUTPUT"
           echo "pkg_version=$pkg_version" >> "$GITHUB_OUTPUT"
           echo "Resolved strongtz ref: $ref -> $sha (snapshot date $pkg_version UTC)"
+
+      - name: Fingerprint Intel sources
+        id: fingerprint
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          I915_TREE: ${{ steps.resolve.outputs.i915_tree }}
+          DRIVER_INPUT: ${{ inputs.driver }}
+        run: |
+          set -euo pipefail
+          case "${DRIVER_INPUT:-both}" in
+            both) drivers='["i915","xe"]' ;;
+            i915) drivers='["i915"]' ;;
+            xe) drivers='["xe"]' ;;
+            *) echo 'Invalid driver selection' >&2; exit 1 ;;
+          esac
+          fingerprints="$(python3 scripts/ci-build.py source-fingerprints)"
+          echo "source_fingerprints=$fingerprints" >> "$GITHUB_OUTPUT"
+          echo "drivers=$drivers" >> "$GITHUB_OUTPUT"
+          echo "Effective source fingerprints: $fingerprints"
 
       - name: Resolve kernel release
         id: resolve_kernel
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KERNEL_RELEASE_INPUT: ${{ inputs.kernel_release }}
         run: |
           set -euo pipefail
-          kr="${KERNEL_RELEASE_INPUT:-latest}"
-          if [ "$kr" = "latest" ]; then
-            # fetch the newest ich777 Unraid kernel release tag
-            kr="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/ich777/unraid_kernel/releases/latest \
-              | jq -er '.tag_name | select(type == "string")')"
-          fi
-          [[ "$kr" =~ ^[0-9]+\.[0-9]+\.[0-9]+-Unraid$ ]] || {
-            echo "Invalid Unraid kernel release: $kr" >&2
-            exit 1
-          }
-          kernels="$(jq -cn --arg primary "$kr" '[$primary, "6.18.58-Unraid"] | unique')"
-          echo "kernel_release=$kr" >> "$GITHUB_OUTPUT"
-          echo "kernel_releases=$kernels" >> "$GITHUB_OUTPUT"
-          echo "Resolved Unraid kernel release: $kr"
-          echo "Build kernel matrix: $kernels"
+          # Official download_list catalog -> matching release notes -> kernels.
+          # Add ich777's latest archive for advance preparation, not as an OS
+          # release channel. All three sources are deduplicated; no fixed floor.
+          python3 scripts/resolve-unraid.py
 
   build:
     needs: resolve
@@ -92,7 +108,8 @@ jobs:
       fail-fast: false
       matrix:
         kernel_release: ${{ fromJSON(needs.resolve.outputs.kernel_releases) }}
-    name: Build ${{ matrix.kernel_release }}
+        driver: ${{ fromJSON(needs.resolve.outputs.drivers) }}
+    name: Build ${{ matrix.driver }} for ${{ matrix.kernel_release }}
     container:
       # Pin the current stable GCC, independently of the kernel's compiler.
       # Newer Unraid kernels require -fmin-function-alignment (gcc >= 14).
@@ -118,114 +135,49 @@ jobs:
       - name: Test build tooling
         shell: bash
         run: |
-          bash -n scripts/*.sh
+          for script in scripts/*.sh; do bash -n "$script"; done
           python3 -m unittest discover -s tests -v
 
       - name: Check if this version is already built
         id: check
         shell: bash
         env:
+          DRIVER: ${{ matrix.driver }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KERNEL_RELEASE: ${{ matrix.kernel_release }}
           I915_REF: ${{ needs.resolve.outputs.i915_ref }}
           PKG_VERSION: ${{ needs.resolve.outputs.pkg_version }}
+          SOURCE_FINGERPRINT: ${{ fromJSON(needs.resolve.outputs.source_fingerprints)[matrix.driver] }}
+          PACKAGE_BUILD_INPUT: ${{ inputs.package_build }}
         run: |
           set -euo pipefail
-          # 手动触发永远编译；只有定时任务才做“有新版本才编译”的判断
-          if [ "$GITHUB_EVENT_NAME" != "schedule" ]; then
-            echo "new_version=true" >> "$GITHUB_OUTPUT"
-            echo "Manual dispatch: always build"
-            exit 0
-          fi
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
-          release="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" "${api}/tags/${KERNEL_RELEASE}" 2>/dev/null || true)"
-          rid="$(jq -r '.id // empty' <<< "$release" 2>/dev/null || true)"
-          if [ -z "$rid" ]; then
-            echo "No release for ${KERNEL_RELEASE} yet -> new driver needed"
-            echo "new_version=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          release_body="$(jq -r '.body // ""' <<< "$release")"
-          pkg_prefix="i915-sriov-${PKG_VERSION}-${KERNEL_RELEASE}-"
-          if [[ "$release_body" == *"strongtz/i915-sriov-dkms @ ${I915_REF} (snapshot ${PKG_VERSION},"* ]] && \
-             jq -e --arg prefix "$pkg_prefix" '
-               [.assets[]?.name] as $names |
-               any($names[]; select(startswith($prefix) and endswith(".txz")) |
-                 . as $pkg | $names | index($pkg + ".md5") != null)
-             ' <<< "$release" >/dev/null; then
-            echo "strongtz master commit ${I915_REF} @ ${KERNEL_RELEASE} already built; skipping"
-            echo "new_version=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "New driver needed: strongtz ${PKG_VERSION} (${I915_REF}) @ ${KERNEL_RELEASE}"
-            echo "new_version=true" >> "$GITHUB_OUTPUT"
-          fi
+          python3 scripts/ci-build.py plan
 
-      - name: Build i915 SR-IOV package
+      - name: Build Intel SR-IOV package
         if: steps.check.outputs.new_version == 'true'
         shell: bash
         env:
+          DRIVER: ${{ matrix.driver }}
           I915_SRIOV_REF: ${{ needs.resolve.outputs.i915_ref }}
           I915_SRIOV_COMMIT: ${{ needs.resolve.outputs.i915_ref }}
           KERNEL_RELEASE: ${{ matrix.kernel_release }}
           PACKAGE_VERSION: ${{ needs.resolve.outputs.pkg_version }}
-          PACKAGE_BUILD: ${{ inputs.package_build }}
+          PACKAGE_BUILD: ${{ steps.check.outputs.package_build }}
+          SOURCE_FINGERPRINT: ${{ fromJSON(needs.resolve.outputs.source_fingerprints)[matrix.driver] }}
+          RECIPE_FINGERPRINT: ${{ steps.check.outputs.recipe_fingerprint }}
+          BUILD_KEY: ${{ steps.check.outputs.build_key }}
         run: |
           set -euo pipefail
           # TARGET_KERNEL_VERSION is like 6.18.44-Unraid; strip the suffix for the tree dir
           export TARGET_KERNEL_VERSION="${KERNEL_RELEASE%-Unraid}"
-          ./scripts/build-i915-sriov.sh
+          ./scripts/build-intel-sriov.sh
 
       - name: Publish Release
         if: steps.check.outputs.new_version == 'true'
         shell: bash
         env:
+          DRIVER: ${{ matrix.driver }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KERNEL_RELEASE: ${{ matrix.kernel_release }}
-          I915_REF: ${{ needs.resolve.outputs.i915_ref }}
-          PKG_VERSION: ${{ needs.resolve.outputs.pkg_version }}
         run: |
           set -euo pipefail
-          pkg="$(ls out/i915-sriov-*.txz | head -1)"
-          pkg_base="$(basename "$pkg")"
-          release_tag="${KERNEL_RELEASE}"
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
-          # Find or create the release for this kernel tag.
-          release="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-                    "${api}/tags/${release_tag}" 2>/dev/null || true)"
-          rid="$(jq -r '.id // empty' <<< "$release" 2>/dev/null || true)"
-          release_body="$(jq -r '.body // ""' <<< "$release" 2>/dev/null || true)"
-          if [ -z "$rid" ]; then
-            rid="$(curl -fsSL -X POST -H "Authorization: Bearer ${GH_TOKEN}" \
-                   -H "Accept: application/vnd.github+json" \
-                   -d "$(jq -n --arg tag "$release_tag" --arg name "i915 SR-IOV for ${release_tag}" \
-                     '{tag_name:$tag,name:$name,body:"Build in progress."}')" \
-                   "${api}" | jq -r '.id')"
-          fi
-          # upload (or replace) the package assets via uploads.github.com
-          upload_api="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${rid}/assets"
-          for f in "$pkg" "$pkg.md5"; do
-            base="$(basename "$f")"
-            asset_id="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
-                        "${api}/${rid}/assets?per_page=100" | \
-                        jq -r --arg n "$base" '.[] | select(.name == $n) | .id' | head -1)"
-            if [ -n "$asset_id" ]; then
-              curl -fsSL -X DELETE -H "Authorization: Bearer ${GH_TOKEN}" \
-                "${api}/assets/${asset_id}"
-            fi
-            curl -fsSL -X POST -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Content-Type: application/octet-stream" \
-              --data-binary "@$f" \
-              "${upload_api}?name=${base}"
-          done
-          # Mark this SHA built only after both uploads succeed, preserving
-          # release notes other than the previous auto-generated source line.
-          release_body="$(sed '\|^Auto-built from strongtz/i915-sriov-dkms @ .* (snapshot .*, i915-only)$|d' <<< "$release_body")"
-          if [ -n "$release_body" ]; then
-            release_body+=$'\n\n'
-          fi
-          release_body+="Auto-built from strongtz/i915-sriov-dkms @ ${I915_REF} (snapshot ${PKG_VERSION}, i915-only)"
-          curl -fsSL -X PATCH -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -d "$(jq -n --arg body "$release_body" '{body:$body}')" \
-            "${api}/${rid}" >/dev/null
-          echo "Published ${pkg_base} to release ${release_tag}"
+          python3 scripts/ci-build.py publish
