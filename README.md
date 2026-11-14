@@ -1,44 +1,46 @@
 # my-i915-sriov-driver
 
-为 **Unraid** 提供独立的 **i915 SR-IOV** 与 **xe SR-IOV** 驱动包，基于 [strongtz/i915-sriov-dkms](https://github.com/strongtz/i915-sriov-dkms)，配合 [my-unraid-vgpu-manager](https://github.com/hellomrli/my-unraid-vgpu-manager) 管理 Intel 核显虚拟功能（VF）及虚拟机直通。
+为 Unraid 构建与内核匹配的 Intel i915 和 xe SR-IOV 驱动包，配合 vGPU 管理插件创建 VF 并直通给虚拟机。
+
+[驱动下载](https://github.com/hellomrli/my-i915-sriov-driver/releases) · [安装与回退](docs/install.md) · [构建维护](docs/building.md) · [文档索引](docs/index.md)
 
 > [!IMPORTANT]
-> **默认、推荐使用 i915。xe 是供测试使用的实验性选项，不会自动替换 i915。**
+> 默认选择 i915。xe 是独立的实验性选项；驱动、完整内核版本和 GPU 型号需要匹配，切换后重启生效。
 
-## 安装管理插件
+## 通过 Unraid 插件安装
 
-**[打开插件安装文件（.plg）](https://github.com/hellomrli/my-unraid-vgpu-manager/raw/master/my-unraid-vgpu-manager.plg)**
-
-在 Unraid 的 **插件（Plugins）→ 安装插件（Install Plugin）** 中粘贴下面的地址。点击代码块右上角的**复制按钮**即可复制完整链接：
+需要 Unraid 7.2.3 或更新版本。在“插件 → 安装插件”中粘贴管理插件地址：
 
 ```text
 https://github.com/hellomrli/my-unraid-vgpu-manager/raw/master/my-unraid-vgpu-manager.plg
 ```
 
-Unraid 会通过 `.plg` 下载对应的插件安装包；后续在插件管理器中更新即可。安装插件后，打开 **设置 → Unraid vGPU 管理器 → 驱动管理**，选择并安装所需的 Intel 驱动。
+安装后打开“设置 → Unraid vGPU 管理器 → 驱动管理”，选择 Intel 的 i915 驱动。插件下载与当前 Unraid 内核匹配的包；重启后，在 Intel 显卡页面查看 VF 并绑定虚拟机。
 
-## i915 还是 xe？
+已有其他插件管理同一驱动时，先按[安装与回退指南](docs/install.md)处理冲突和启动参数。
 
-| 驱动 | 定位与建议 |
-|---|---|
-| **i915（默认、推荐）** | 保持本项目已有的使用路线；现有用户无需为上游 xe 更新而切换驱动。 |
-| **xe（实验性）** | Intel 较新的驱动架构，作为独立可选包提供，适合愿意验证硬件和客户机兼容性、能够排查及回退的用户。 |
+## 选择 i915 或 xe
 
-**xe 较新不等于在 Unraid SR-IOV 中一定更快、更稳定。** 主线驱动的普通图形支持与本项目使用的社区 SR-IOV 移植不是同一回事；应结合 GPU 型号、宿主内核、客户机驱动和实际负载判断，不能仅凭提交数量比较优劣。
+| 驱动 | 使用场景 | 发布形式 |
+|---|---|---|
+| i915 | 默认路线，优先用于现有配置 | `i915-sriov-日期-内核-构建号.txz` |
+| xe | 需要验证硬件和客户机兼容性的实验环境 | `xe-sriov-日期-内核-构建号.txz` |
 
-两个包均来自社区实验性移植，并非 Intel 官方支持承诺。[上游说明](https://github.com/strongtz/i915-sriov-dkms#required-kernel-parameters)目前特别警告其 **xe 模块不支持 MTL（Meteor Lake）和 LNL（Lunar Lake）**；这不代表主线 xe 的支持情况，也不保证这些平台都能使用 i915 SR-IOV。
+两者来自 [strongtz/i915-sriov-dkms](https://github.com/strongtz/i915-sriov-dkms) 的社区移植，不代表 Intel 官方对 Unraid SR-IOV 的支持。xe 的主线图形支持与该移植的 SR-IOV 支持不同；不能仅因架构较新就推断性能或稳定性更好。
 
-## 切换与回退
+上游特别提示其 xe 模块不支持 Meteor Lake 和 Lunar Lake。其他硬件也应核对上游要求，不能由驱动名称推断兼容性。
 
-1. 在插件的 **驱动管理 → Intel SR-IOV 驱动** 中选择 i915 或 xe。已有配置和新安装均默认 i915；升级插件不会自动切换。
-2. 插件下载并校验独立驱动包、保留回退缓存，准备下次启动配置；**切换需要重启**，不会热切换正在使用的驱动或 VF。重启前可以取消切换。
-3. 测试 xe 前，关闭使用 GPU 的虚拟机和容器的自动启动。重启后先检查实际加载的驱动与 VF 直通，再启动工作负载；驱动启动失败不保证 Unraid 会阻止自动启动。
-4. 若测试异常，选择 i915 并再次重启回退。两个包共用兼容层，**不要手动同时安装**，也不要将物理功能（PF）直通给虚拟机。
+## 驱动更新如何发布
 
-安装驱动前，请卸载管理同一驱动的其他插件并重启。IOMMU、启动参数冲突、客户机驱动与具体操作见[管理插件中文说明](https://github.com/hellomrli/my-unraid-vgpu-manager/blob/master/README.zh-CN.md)。
+- 跟踪当前 Unraid 正式版、公开 beta/RC 版本对应内核，以及 ich777 最新内核，合并去重。
+- i915 和 xe 独立检查实际相关源码，只有受影响的驱动重新构建。
+- 包版本来自固定上游 commit 的 UTC 日期；同日重建使用递增构建号。
+- 每个包附带 `.md5`，实际可用组合以 Releases 为准。
 
-## 内核覆盖与更新
+历史内核退出当前目标后不再跟进，已发布包仍保留。更新和回退由[管理插件](https://github.com/hellomrli/my-unraid-vgpu-manager)执行。
 
-只维护[当前 Unraid 正式版及公开测试版](https://docs.unraid.net/unraid-os/download_list/)在对应 [Release notes](https://docs.unraid.net/category/release-notes/) 中列出的内核，以及 [ich777 最新内核](https://github.com/ich777/unraid_kernel/releases/latest)，合并去重后分别提供两种驱动。ich777 内核用于提前准备即将发布的系统版本；退出这些来源的历史内核不再跟进更新，已有有效包保留。
+## 开发与反馈
 
-i915 与 xe 独立检查实际相关源码变化：仅 xe 更新不会重新发布未变化的 i915，文档等不参与构建的上游改动也不会触发无效更新；共享依赖或必要的兼容修复仍会更新受影响的驱动。
+构建入口、环境变量、CI 目标和离线检查见[构建维护](docs/building.md)。使用问题优先附上 GPU 型号、Unraid 与 `uname -r` 结果、i915/xe 选择和相关日志，再提交 [Issue](https://github.com/hellomrli/my-i915-sriov-driver/issues)。
+
+本仓库目前没有根目录许可证文件；上游驱动和兼容代码沿用各自授权。
